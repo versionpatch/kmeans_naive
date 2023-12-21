@@ -8,13 +8,11 @@
 #include <iostream>
 #include <chrono>
 #include <thread>
+#include <numeric>
 
-static constexpr int N = 100001;
-static constexpr int D = 305;
-static constexpr int K = 300;
 
 template<int tile_size_x, int tile_size_d, int tile_size_c, int x_per_thread, int c_per_thread>
-__global__ void kmeans_try_seven(float* data, float* centroids, float* result)
+__global__ void kmeans_try_seven(float* data, float* centroids, float* result, const int N,const int D,const int K)
 {
 	const int bx = blockIdx.x;
 	const int by = blockIdx.y;
@@ -96,7 +94,9 @@ __global__ void kmeans_try_seven(float* data, float* centroids, float* result)
 	
 }
 
-__global__ void kmeans_argmin(const float* input, int* output)
+
+template<int maxK>
+__global__ void kmeans_argmin(const float* input, int* output, const int K)
 {
 	const int bx = blockIdx.x;
 	const int tx = threadIdx.x;
@@ -104,8 +104,8 @@ __global__ void kmeans_argmin(const float* input, int* output)
 
 	const int block_start = bx * K;
 
-	__shared__ float to_reduce[(K+1) / 2];
-	__shared__ int to_reduce_idx[(K+1) / 2];
+	__shared__ float to_reduce[(maxK + 1) / 2];
+	__shared__ int to_reduce_idx[(maxK +1) / 2];
 
 	//copy into shared memory and do one reduction
 	if (tx + ((K + 1) / 2) < K)
@@ -154,7 +154,42 @@ __global__ void kmeans_argmin(const float* input, int* output)
 		output[bx] = to_reduce_idx[0];
 }
 
-__global__ void kmeans_centroids_sequential(const float* data, const int* cluster_index, int* locks, int* cluster_count, float* result)
+template<int maxK>
+__global__ void kmeans_min(const float* input, float* output, const int K)
+{
+	const int bx = blockIdx.x;
+	const int tx = threadIdx.x;
+	const int Tx = blockDim.x;
+
+	const int block_start = bx * K;
+
+	__shared__ float to_reduce[(maxK + 1) / 2];
+
+	//copy into shared memory and do one reduction
+	if (tx + ((K + 1) / 2) < K)
+		to_reduce[tx] = min(input[block_start + tx], input[block_start + tx + ((K + 1) / 2)]);
+	else
+		to_reduce[tx] = input[block_start + tx];
+
+	__syncthreads();
+
+	int to_reduce_size = (K + 1) / 2;
+	while (to_reduce_size > 1)
+	{
+		int half_reduce_size = (to_reduce_size + 1) / 2;
+		if (tx + half_reduce_size < to_reduce_size)
+		{
+			to_reduce[tx] = min(to_reduce[tx], to_reduce[tx + half_reduce_size]);
+		}
+		to_reduce_size = half_reduce_size;
+		__syncthreads();
+	}
+
+	if (tx == 0)
+		output[bx] = to_reduce[0];
+}
+
+__global__ void kmeans_centroids_sequential(const float* data, const int* cluster_index, int* locks, int* cluster_count, float* result, const int D)
 {
 	const int tx = threadIdx.x;
 	const int bx = blockIdx.x;
@@ -175,8 +210,13 @@ __global__ void kmeans_centroids_sequential(const float* data, const int* cluste
 }
 
 
+
+
 void averaging_test()
 {
+
+	int D = 300;
+
 	float* data_d;
 	float* centroids_d;
 	int* locks_d;
@@ -204,7 +244,7 @@ void averaging_test()
 	std::vector<int> indices({0,0,1,1,0,1,2,1,0,0});
 	cudaMemcpy(indices_d, indices.data(), 10 * sizeof(int), cudaMemcpyHostToDevice);
 
-	kmeans_centroids_sequential <<< 10, D >>> (data_d, indices_d, locks_d, cluster_counts_d, centroids_d);
+	kmeans_centroids_sequential<<< 10, D >>> (data_d, indices_d, locks_d, cluster_counts_d, centroids_d, D);
 
 	std::vector<float> result(3 * D);
 	cudaMemcpy(result.data(), centroids_d, 3 * D * sizeof(float), cudaMemcpyDeviceToHost);
@@ -245,12 +285,111 @@ void averaging_test()
 	
 }
 
+void distance_test()
+{
+float* data_d;
+	float* centroids_d;
+	float* result_d;
+
+	constexpr int N = 10;
+	constexpr int K = 3;
+	constexpr int D = 2;
+
+	cudaMalloc(&data_d, N * D * sizeof(float));
+	cudaMalloc(&centroids_d, K * D * sizeof(float));
+	cudaMalloc(&result_d, N * K * sizeof(float));
+
+	std::vector<float> data(N * D);
+	for (int i = 0; i < N; i++)
+	{
+		data[i * D] = i;
+	}
+	cudaMemcpy(data_d, data.data(), N * D * sizeof(float), cudaMemcpyHostToDevice);
+	std::vector<float> centroids(K * D);
+	for (int i = 0; i < K; i++)
+	{
+		centroids[i * D] = -i;
+		centroids[i * D + 1] = i;
+	}
+	cudaMemcpy(centroids_d, centroids.data(), K * D * sizeof(float), cudaMemcpyHostToDevice);
+
+	constexpr int tile_size_x = 128;
+	constexpr int tile_size_d = 16;
+	constexpr int tile_size_c = 128;
+	dim3 grid((N + tile_size_x - 1) / tile_size_x, (K + tile_size_c - 1) / tile_size_c);
+	dim3 block(tile_size_x / 8, tile_size_c / 8);
+	kmeans_try_seven<tile_size_x, tile_size_d, tile_size_c, 8, 8> << < grid, block >> > (data_d, centroids_d, result_d, 10, 2, 3);
+	cudaDeviceSynchronize();
+	std::vector<float> result(10 * 3);
+	cudaMemcpy(result.data(), result_d, 10 * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+
+	bool pass = true;
+	for (int i = 0; i < 10; i++)
+	{
+		for (int j = 0; j < 3; j++)
+		{
+			float expected = (i + j) * (i + j) + j * j;
+			if (std::abs(result[i * 3 + j] - expected) > 0.0001f)
+			{
+				pass = false;
+				std::cout << i << "," << j << " : Expected: " << expected << " Got: " << result[i * 3 + j] << "\n";
+				break;
+			}
+		}
+		if (!pass)
+			break;
+	}
+
+	std::cout << "Result for distance computation test : " << (pass ? "PASS" : "FAIL") << "\n";
+
+	if (!pass)
+	{
+		cudaFree(data_d);
+		cudaFree(centroids_d);
+		cudaFree(result_d);
+		return;
+	}
+
+	//get min
+	float* min_array_d;
+	cudaMalloc(&min_array_d, N * sizeof(float));
+	kmeans_min<K> << < N, (K + 1) / 2 >> > (result_d, min_array_d, K);
+	std::vector<float> min_array(N);
+	cudaMemcpy(min_array.data(), min_array_d, N * sizeof(float), cudaMemcpyDeviceToHost);
+
+	for (int i = 0; i < 10; i++)
+	{
+		float expected = i * i;
+		if (std::abs(min_array[i] - expected) > 0.0001f)
+		{
+			pass = false;
+			std::cout << i << " : Expected: " << expected << " Got: " << min_array[i] << "\n";
+			break;
+		}
+	}
+
+	std::cout << "Result for min computation test : " << (pass ? "PASS" : "FAIL") << "\n";
+
+	cudaFree(data_d);
+	cudaFree(centroids_d);
+	cudaFree(result_d);
+	cudaFree(min_array_d);
+
+}
+
+static constexpr int N = 100001;
+static constexpr int D = 300;
+static constexpr int K = 64;
+
+
 
 int main()
 {
+
+	distance_test();
 	std::random_device device;
 	std::mt19937 generator(device());
-	std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+	std::normal_distribution<float> distribution(0.0f, 1.0f);
 	std::uniform_int_distribution<int> random_x(0, N - 1);
 
 	std::vector<float> data(N * D);
@@ -258,12 +397,17 @@ int main()
 
 	std::cout << "Generating data.\n";
 
+	//generate a vector of indices from 0 to N-1 and shuffle it
+	std::vector<int> indices(N);
+	std::iota(indices.begin(), indices.end(), 0);
+	std::shuffle(indices.begin(), indices.end(), generator);
+
 	for (int i = 0; i < N; i++)
 	{
-		data[i * D] = (i / (N / K)) + 0.49f * distribution(generator);
-		for (int j = 1;j < D;j++)
+		data[i * D] = 200 * (indices[i] / (N / K)) + 0.49f * distribution(generator);
+		for (int j = 1; j < D; j++)
 		{
-			data[i * D + j] = 0.49f * distribution(generator);
+			data[i * D + j] = 200 * (indices[i] / (N / K)) + 0.49f * distribution(generator);
 		}
 	}
 
@@ -281,7 +425,7 @@ int main()
 	cudaMalloc(&argmin_d, N * sizeof(int));
 	cudaMalloc(&centroid_count_d, K * sizeof(int));
 	cudaMalloc(&locks_d, K * sizeof(int));
-	
+
 	cudaMemcpy(data_d, data.data(), N * D * sizeof(float), cudaMemcpyHostToDevice);
 	for (int i = 0; i < K; i++)
 	{
@@ -302,8 +446,8 @@ int main()
 
 	for (int i = 0; i < 1; i++)
 	{
-		kmeans_try_seven<tile_size_x, tile_size_d, tile_size_c, 8, 8> << <grid, block >> > (data_d, centroids_d, result_d);
-		kmeans_argmin << < N, (K + 1) / 2 >> > (result_d, argmin_d);
+		kmeans_try_seven<tile_size_x, tile_size_d, tile_size_c, 8, 8> << <grid, block >> > (data_d, centroids_d, result_d, N, D, K);
+		kmeans_argmin<K> << < N, (K + 1) / 2 >> > (result_d, argmin_d, K);
 		for (int i = 0; i < K; i++)
 		{
 			int idx = random_x(generator);
@@ -311,26 +455,24 @@ int main()
 		}
 		cudaMemset(locks_d, 0, K * sizeof(int));
 		cudaMemset(centroid_count_d, 0, K * sizeof(int));
-		kmeans_centroids_sequential << < N, D >> > (data_d, argmin_d, locks_d, centroid_count_d, centroids_d);
+		kmeans_centroids_sequential<< < N, D >> > (data_d, argmin_d, locks_d, centroid_count_d, centroids_d, D);
 	}
 	cudaDeviceSynchronize();
 	cudaMemcpy(centroids.data(), centroids_d, K * D * sizeof(float), cudaMemcpyDeviceToHost);
 	auto duration = std::chrono::high_resolution_clock::now() - now;
 	std::cout << "Data received. Finished computation.\n";
 	std::cout << "GPU time: " << std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() << "ms\n";
+
+	//find cluster with minimum first dimension
+	int min_cluster = 0;
+	for (int i = 1; i < K; i++)
+	{
+		if (centroids[i * D] < centroids[min_cluster * D])
+			min_cluster = i;
+	}	
+
+
 	
-	std::vector<int> centroids_int(K);
-	for (int i = 0; i < K; i++)
-	{
-		centroids_int[i] = (int)centroids[i * D];
-	}
-	std::sort(centroids_int.begin(), centroids_int.end());
-	for (int i = 0; i < K; i++)
-	{
-		std::cout << centroids_int[i] << "\n";
-	}
-
-
 	cudaFree(data_d);
 	cudaFree(centroids_d);
 	cudaFree(result_d);
