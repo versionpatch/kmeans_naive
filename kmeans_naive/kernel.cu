@@ -14,7 +14,7 @@
 #include <numeric>
 
 
-template<int tile_size_x, int tile_size_d, int tile_size_c, int x_per_thread, int c_per_thread, bool update_min = false>
+template<int tile_size_x, int tile_size_d, int tile_size_c, int x_per_thread, int c_per_thread>
 __global__ void kmeans_try_seven(float* data, float* centroids, float* result, const int N,const int D,const int K)
 {
 	const int bx = blockIdx.x;
@@ -81,18 +81,66 @@ __global__ void kmeans_try_seven(float* data, float* centroids, float* result, c
 		{
 			if (block_start_x + i * Tx + tx < N && block_start_c + j * Ty + ty < K)
 			{
-				if constexpr (update_min)
-				{
-					float old = result[(block_start_c + j * Ty + ty) + (block_start_x + i * Tx + tx) * K];
-					result[(block_start_c + j * Ty + ty) + (block_start_x + i * Tx + tx) * K] = min(sums[j][i], old);
-				}
-				else
-					result[(block_start_c + j * Ty + ty) + (block_start_x + i * Tx + tx) * K] = sums[j][i];
+				result[(block_start_c + j * Ty + ty) + (block_start_x + i * Tx + tx) * K] = sums[j][i];
 			}
 		}
 	}
 
 	
+}
+
+template<int x_per_block, int D, bool update_min=false>
+__global__ void distance_one_centroid(float* data, float* centroid, float* result, const int N)
+{
+	const int bx = blockIdx.x;
+	const int by = blockIdx.y;
+	const int tx = threadIdx.x;
+	const int ty = threadIdx.y;
+	const int Tx = blockDim.x;
+	const int Ty = blockDim.y;
+
+	__shared__ float stuff_to_sum[32];
+	
+
+	for (int x = 0; x < x_per_block; x++)
+	{
+		if (bx * x_per_block + x >= N)
+			break;
+
+		float sum = 0.0f;
+
+		for (int i = 0; i < D / 32; i++)
+		{
+			if (tx + i * 32 < D)
+			{
+				float ds = data[(bx * x_per_block + x) * D + i * 32 + tx] - centroid[tx + i * Tx];
+				sum += ds * ds;
+			}
+		}
+
+		stuff_to_sum[tx] = sum;
+
+		__syncthreads();
+
+		if (tx == 0)
+		{
+			for (int i = 1; i < 32; i++)
+			{
+				stuff_to_sum[0] += stuff_to_sum[i];
+			}
+		}
+
+		if constexpr (update_min)
+		{
+			if (tx == 0)
+				result[bx * x_per_block + x] = min(stuff_to_sum[0], result[bx * x_per_block + x]);
+		}
+		else
+		{
+			if (tx == 0)
+				result[bx * x_per_block + x] = stuff_to_sum[0];
+		}
+	}
 }
 
 template<int maxK>
@@ -389,7 +437,7 @@ float* data_d;
 
 }
 
-static constexpr int N = 100001;
+static constexpr int N = 100004;
 static constexpr int D = 300;
 static constexpr int K = 300;
 
@@ -421,19 +469,15 @@ void kmeans_plus_plus_init(float* data, float* centroids)
 	int idx = random_x(generator);
 	cudaMemcpy(centroids, data + idx * D, D * sizeof(float), cudaMemcpyHostToDevice);
 	
-	//hyperparameters (maybe optimize for small K ?)
-	constexpr int tile_size_x = 256;
-	constexpr int tile_size_d = 16;
-	constexpr int tile_size_c = 1;
-	dim3 grid((N + tile_size_x - 1) / tile_size_x, 1);
-	dim3 block(tile_size_x / 1, tile_size_c / 1);
-	std::vector<float> min_array(N);
+	dim3 grid((N) / 1, 1);
+	dim3 block(32, 1);
+	
 	for (int num_centroids = 1; num_centroids != K; num_centroids++)
 	{		
 		if (num_centroids == 1)
-			kmeans_try_seven<tile_size_x, tile_size_d, tile_size_c, 1, 1, false> << < grid, block >> > (data, centroids, min_array_d, N, D, 1);
+			distance_one_centroid<1, D, false> << < grid, block >> > (data, centroids, min_array_d, N);
 		else
-			kmeans_try_seven<tile_size_x, tile_size_d, tile_size_c, 1, 1, true> << < grid, block >> > (data, centroids + (num_centroids - 1) * D, min_array_d, N, D, 1);
+			distance_one_centroid<1, D, true> << < grid, block >> > (data, centroids + (num_centroids - 1) * D, min_array_d, N);
 		
 
 		thrust::inclusive_scan(min_array_dev_ptr, min_array_dev_ptr + N, prob_sequence_dev_ptr);
@@ -509,7 +553,7 @@ int main()
 
 	kmeans_plus_plus_init<N, K, D>(data_d, centroids_d);
 
-	for (int i = 0; i < 0; i++)
+	for (int i = 0; i < 5; i++)
 	{
 		kmeans_try_seven<tile_size_x, tile_size_d, tile_size_c, 8, 8> << <grid, block >> > (data_d, centroids_d, result_d, N, D, K);
 		kmeans_argmin<K> << < N, (K + 1) / 2 >> > (result_d, argmin_d, K);
@@ -526,7 +570,6 @@ int main()
 	cudaMemcpy(centroids.data(), centroids_d, K * D * sizeof(float), cudaMemcpyDeviceToHost);
 	auto duration = std::chrono::high_resolution_clock::now() - now;
 	std::cout << "Data received. Finished computation.\n";
-	std::cout << "GPU time: " << std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() << "ms\n";
 
 	std::vector<float> clusters_first_dim(K);
 	for (int i = 0; i < K; i++)
