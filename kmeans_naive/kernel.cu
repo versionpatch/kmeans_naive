@@ -14,7 +14,7 @@
 #include <numeric>
 
 
-template<int tile_size_x, int tile_size_d, int tile_size_c, int x_per_thread, int c_per_thread>
+template<int tile_size_x, int tile_size_d, int tile_size_c, int x_per_thread, int c_per_thread, bool update_min = false>
 __global__ void kmeans_try_seven(float* data, float* centroids, float* result, const int N,const int D,const int K)
 {
 	const int bx = blockIdx.x;
@@ -33,44 +33,34 @@ __global__ void kmeans_try_seven(float* data, float* centroids, float* result, c
 	__shared__ float centroid_shared[tile_size_c][tile_size_d];
 	
 	float sums[c_per_thread][x_per_thread] = { 0.0f };
-	//float x_cache[x_per_thread] = { 0.0f };
-	//float c_cache[c_per_thread] = { 0.0f };
 
 
 	for (int from = 0; from < D; from += tile_size_d)
 	{
 		int to = from + tile_size_d;
 		
-		for (int i = 0;i < tile_size_x * tile_size_d / (Tx * Ty);i++)
+		for (int i = 0;i < max(tile_size_x * tile_size_d / (Tx * Ty), 1);i++)
 		{
 			int local_data_idx = (tx + ty * Tx + i * Tx * Ty) / tile_size_d;
 			int local_data_offset = (tx + ty * Tx + i * Tx * Ty) % tile_size_d;
-			if (from + local_data_offset < D && block_start_x + local_data_idx < N)
+			if (from + local_data_offset < D && block_start_x + local_data_idx < N && local_data_idx < tile_size_x)
 				data_shared[local_data_offset][local_data_idx] = data[(block_start_x + local_data_idx) * D + (from + local_data_offset)];
-			else
+			else if (local_data_idx < tile_size_x)
 				data_shared[local_data_offset][local_data_idx] = 0.0f;
 		}
-		for (int i = 0; i < tile_size_c * tile_size_d / (Tx * Ty); i++)
+		for (int i = 0; i < max(tile_size_c * tile_size_d / (Tx * Ty), 1); i++)
 		{
 			int local_centroid_idx = (tx + ty * Tx + i * Tx * Ty) / tile_size_d;
 			int local_centroid_offset = (tx + ty * Tx + i * Tx * Ty) % tile_size_d;
-			if (from + local_centroid_offset < D && block_start_c + local_centroid_idx < K)
+			if (from + local_centroid_offset < D && block_start_c + local_centroid_idx < K && local_centroid_idx < tile_size_c)
 				centroid_shared[local_centroid_idx][local_centroid_offset] = centroids[(block_start_c + local_centroid_idx) * D + (from + local_centroid_offset)];
-			else
+			else if (local_centroid_idx < tile_size_c)
 				centroid_shared[local_centroid_idx][local_centroid_offset] = 0.0f;
 		}
 		
 		__syncthreads();
 		for (int k = 0; k < tile_size_d; k++)
-		{
-			
-			/*for (int j = 0; j < c_per_thread; j++)
-				c_cache[j] = centroid_shared[ty + Ty * j][k];
-			*/
-			/*for (int i = 0; i < x_per_thread; i++)
-				x_cache[i] = data_shared[k][tx + Tx * i];
-				*/
-			
+		{			
 			for (int j = 0; j < c_per_thread; j++)
 			{
 				float centroid_value = centroid_shared[ty + Ty * j][k];
@@ -90,13 +80,20 @@ __global__ void kmeans_try_seven(float* data, float* centroids, float* result, c
 		for (int j = 0; j < c_per_thread; j++)
 		{
 			if (block_start_x + i * Tx + tx < N && block_start_c + j * Ty + ty < K)
-				result[(block_start_c + j * Ty + ty) + (block_start_x + i * Tx + tx) * K] = sums[j][i];
+			{
+				if constexpr (update_min)
+				{
+					float old = result[(block_start_c + j * Ty + ty) + (block_start_x + i * Tx + tx) * K];
+					result[(block_start_c + j * Ty + ty) + (block_start_x + i * Tx + tx) * K] = min(sums[j][i], old);
+				}
+				else
+					result[(block_start_c + j * Ty + ty) + (block_start_x + i * Tx + tx) * K] = sums[j][i];
+			}
 		}
 	}
 
 	
 }
-
 
 template<int maxK>
 __global__ void kmeans_argmin(const float* input, int* output, const int K)
@@ -327,9 +324,9 @@ float* data_d;
 	cudaMemcpy(result.data(), result_d, 10 * 3 * sizeof(float), cudaMemcpyDeviceToHost);
 
 	bool pass = true;
-	for (int i = 0; i < 10; i++)
+	for (int i = 0; i < N; i++)
 	{
-		for (int j = 0; j < 3; j++)
+		for (int j = 0; j < K; j++)
 		{
 			float expected = (i + j) * (i + j) + j * j;
 			if (std::abs(result[i * 3 + j] - expected) > 0.0001f)
@@ -360,7 +357,7 @@ float* data_d;
 	std::vector<float> min_array(N);
 	cudaMemcpy(min_array.data(), min_array_d, N * sizeof(float), cudaMemcpyDeviceToHost);
 
-	for (int i = 0; i < 10; i++)
+	for (int i = 0; i < N; i++)
 	{
 		float expected = i * i;
 		if (std::abs(min_array[i] - expected) > 0.0001f)
@@ -404,21 +401,20 @@ void kmeans_plus_plus_init(float* data, float* centroids)
 	std::uniform_int_distribution<int> random_x(0, N - 1);
 	std::uniform_real_distribution<float> random_p(0.0f, 1.0f);
 
-	float* result_d;
 	float* min_array_d;
 	float* prob_number;
+	float* prob_sequence_d;
 	int* pulled_index;
 	
-	cudaMalloc(&result_d, N * K * sizeof(float));
 	cudaMalloc(&min_array_d, N * sizeof(float));
+	cudaMalloc(&prob_sequence_d, N * sizeof(float));
 	cudaMalloc(&pulled_index, sizeof(int));
 	cudaMalloc(&prob_number, sizeof(float));
-
-	cudaMemcpy(result_d, data, N * K * sizeof(float), cudaMemcpyHostToDevice);
 
 	auto min_array_dev_ptr = thrust::device_pointer_cast(min_array_d);
 	auto pulled_index_dev_ptr = thrust::device_pointer_cast(pulled_index);
 	auto prob_number_dev_ptr = thrust::device_pointer_cast(prob_number);
+	auto prob_sequence_dev_ptr = thrust::device_pointer_cast(prob_sequence_d);
 
 
 	//initiate first centroid
@@ -426,28 +422,31 @@ void kmeans_plus_plus_init(float* data, float* centroids)
 	cudaMemcpy(centroids, data + idx * D, D * sizeof(float), cudaMemcpyHostToDevice);
 	
 	//hyperparameters (maybe optimize for small K ?)
-	constexpr int tile_size_x = 128;
+	constexpr int tile_size_x = 256;
 	constexpr int tile_size_d = 16;
-	constexpr int tile_size_c = 128;
-	dim3 grid((N + tile_size_x - 1) / tile_size_x, (K + tile_size_c - 1) / tile_size_c);
-	dim3 block(tile_size_x / 8, tile_size_c / 8);
-
+	constexpr int tile_size_c = 1;
+	dim3 grid((N + tile_size_x - 1) / tile_size_x, 1);
+	dim3 block(tile_size_x / 1, tile_size_c / 1);
+	std::vector<float> min_array(N);
 	for (int num_centroids = 1; num_centroids != K; num_centroids++)
-	{
-		std::cout << "Centroid " << num_centroids << " out of " << K << "\n";
-		kmeans_try_seven<tile_size_x, tile_size_d, tile_size_c, 8, 8> << < grid, block >> > (data, centroids, result_d, N, D, num_centroids);
-		kmeans_min<K> << < N, (K + 1) / 2 >> > (result_d, min_array_d, num_centroids);
-		thrust::inclusive_scan(min_array_dev_ptr, min_array_dev_ptr + N, min_array_dev_ptr);
+	{		
+		if (num_centroids == 1)
+			kmeans_try_seven<tile_size_x, tile_size_d, tile_size_c, 1, 1, false> << < grid, block >> > (data, centroids, min_array_d, N, D, 1);
+		else
+			kmeans_try_seven<tile_size_x, tile_size_d, tile_size_c, 1, 1, true> << < grid, block >> > (data, centroids + (num_centroids - 1) * D, min_array_d, N, D, 1);
+		
+
+		thrust::inclusive_scan(min_array_dev_ptr, min_array_dev_ptr + N, prob_sequence_dev_ptr);
 		float sum;
-		cudaMemcpy(&sum, min_array_d + N - 1, sizeof(float), cudaMemcpyDeviceToHost);
+		cudaMemcpy(&sum, prob_sequence_d + N - 1, sizeof(float), cudaMemcpyDeviceToHost);
+
 		float p = random_p(generator) * sum;
 		cudaMemcpy(prob_number, &p, sizeof(float), cudaMemcpyHostToDevice);
-		thrust::lower_bound(min_array_dev_ptr, min_array_dev_ptr + N, prob_number_dev_ptr, prob_number_dev_ptr + 1, pulled_index_dev_ptr);
+		thrust::lower_bound(prob_sequence_dev_ptr, prob_sequence_dev_ptr + N, prob_number_dev_ptr, prob_number_dev_ptr + 1, pulled_index_dev_ptr);
 		cudaMemcpy(&idx, pulled_index, sizeof(int), cudaMemcpyDeviceToHost);
 		cudaMemcpy(centroids + num_centroids * D, data + idx * D, D * sizeof(float), cudaMemcpyHostToDevice);
 	}
 
-	cudaFree(result_d);
 	cudaFree(min_array_d);
 	cudaFree(pulled_index);
 	cudaFree(prob_number);
@@ -474,10 +473,10 @@ int main()
 
 	for (int i = 0; i < N; i++)
 	{
-		data[i * D] = 200 * (indices[i] / (N / K)) + 0.49f * distribution(generator);
+		data[i * D] = 30 * (indices[i] / (N / K)) + 0.49f * distribution(generator);
 		for (int j = 1; j < D; j++)
 		{
-			data[i * D + j] = 200 * (indices[i] / (N / K)) + 0.49f * distribution(generator);
+			data[i * D + j] = 30 * (indices[i] / (N / K)) + 0.49f * distribution(generator);
 		}
 	}
 
@@ -497,15 +496,7 @@ int main()
 	cudaMalloc(&locks_d, K * sizeof(int));
 
 	cudaMemcpy(data_d, data.data(), N * D * sizeof(float), cudaMemcpyHostToDevice);
-	/*
-	for (int i = 0; i < K; i++)
-	{
-		int idx = random_x(generator);
-		cudaMemcpy(centroids_d + i * D, data_d + idx * D, D * sizeof(float), cudaMemcpyDeviceToDevice);
-	}
-	*/
 	
-
 	//hyperparams
 	constexpr int tile_size_x = 128;
 	constexpr int tile_size_d = 16;
@@ -518,7 +509,7 @@ int main()
 
 	kmeans_plus_plus_init<N, K, D>(data_d, centroids_d);
 
-	for (int i = 0; i < 10; i++)
+	for (int i = 0; i < 0; i++)
 	{
 		kmeans_try_seven<tile_size_x, tile_size_d, tile_size_c, 8, 8> << <grid, block >> > (data_d, centroids_d, result_d, N, D, K);
 		kmeans_argmin<K> << < N, (K + 1) / 2 >> > (result_d, argmin_d, K);
@@ -550,7 +541,7 @@ int main()
 		std::cout << clusters_first_dim[i] << ", ";
 		std::cout << "\n";
 	}
-
+	std::cout << "GPU time: " << std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() << "ms\n";
 
 	
 	cudaFree(data_d);
