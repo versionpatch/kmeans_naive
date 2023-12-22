@@ -2,6 +2,9 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "cuda.h"
+#include "thrust/scan.h"
+#include "thrust/binary_search.h"
+#include "thrust/device_ptr.h"
 
 #include <stdio.h>
 #include <random>
@@ -168,7 +171,7 @@ __global__ void kmeans_min(const float* input, float* output, const int K)
 	//copy into shared memory and do one reduction
 	if (tx + ((K + 1) / 2) < K)
 		to_reduce[tx] = min(input[block_start + tx], input[block_start + tx + ((K + 1) / 2)]);
-	else
+	else if (tx < K)
 		to_reduce[tx] = input[block_start + tx];
 
 	__syncthreads();
@@ -370,6 +373,18 @@ float* data_d;
 
 	std::cout << "Result for min computation test : " << (pass ? "PASS" : "FAIL") << "\n";
 
+	auto dev_ptr = thrust::device_pointer_cast(min_array_d);
+	thrust::inclusive_scan(dev_ptr, dev_ptr + N, dev_ptr);
+	std::vector<float> min_array_scan(N);
+	cudaMemcpy(min_array_scan.data(), min_array_d, N * sizeof(float), cudaMemcpyDeviceToHost);
+	//print array
+	for (int i = 0; i < N; i++)
+	{
+		std::cout << min_array_scan[i] / min_array_scan[N - 1] << ", ";
+	}
+	std::cout << '\n';
+
+
 	cudaFree(data_d);
 	cudaFree(centroids_d);
 	cudaFree(result_d);
@@ -379,14 +394,69 @@ float* data_d;
 
 static constexpr int N = 100001;
 static constexpr int D = 300;
-static constexpr int K = 64;
+static constexpr int K = 300;
 
+template<int N, int K, int D>
+void kmeans_plus_plus_init(float* data, float* centroids)
+{
+	std::random_device device;
+	std::mt19937 generator(device());
+	std::uniform_int_distribution<int> random_x(0, N - 1);
+	std::uniform_real_distribution<float> random_p(0.0f, 1.0f);
+
+	float* result_d;
+	float* min_array_d;
+	float* prob_number;
+	int* pulled_index;
+	
+	cudaMalloc(&result_d, N * K * sizeof(float));
+	cudaMalloc(&min_array_d, N * sizeof(float));
+	cudaMalloc(&pulled_index, sizeof(int));
+	cudaMalloc(&prob_number, sizeof(float));
+
+	cudaMemcpy(result_d, data, N * K * sizeof(float), cudaMemcpyHostToDevice);
+
+	auto min_array_dev_ptr = thrust::device_pointer_cast(min_array_d);
+	auto pulled_index_dev_ptr = thrust::device_pointer_cast(pulled_index);
+	auto prob_number_dev_ptr = thrust::device_pointer_cast(prob_number);
+
+
+	//initiate first centroid
+	int idx = random_x(generator);
+	cudaMemcpy(centroids, data + idx * D, D * sizeof(float), cudaMemcpyHostToDevice);
+	
+	//hyperparameters (maybe optimize for small K ?)
+	constexpr int tile_size_x = 128;
+	constexpr int tile_size_d = 16;
+	constexpr int tile_size_c = 128;
+	dim3 grid((N + tile_size_x - 1) / tile_size_x, (K + tile_size_c - 1) / tile_size_c);
+	dim3 block(tile_size_x / 8, tile_size_c / 8);
+
+	for (int num_centroids = 1; num_centroids != K; num_centroids++)
+	{
+		std::cout << "Centroid " << num_centroids << " out of " << K << "\n";
+		kmeans_try_seven<tile_size_x, tile_size_d, tile_size_c, 8, 8> << < grid, block >> > (data, centroids, result_d, N, D, num_centroids);
+		kmeans_min<K> << < N, (K + 1) / 2 >> > (result_d, min_array_d, num_centroids);
+		thrust::inclusive_scan(min_array_dev_ptr, min_array_dev_ptr + N, min_array_dev_ptr);
+		float sum;
+		cudaMemcpy(&sum, min_array_d + N - 1, sizeof(float), cudaMemcpyDeviceToHost);
+		float p = random_p(generator) * sum;
+		cudaMemcpy(prob_number, &p, sizeof(float), cudaMemcpyHostToDevice);
+		thrust::lower_bound(min_array_dev_ptr, min_array_dev_ptr + N, prob_number_dev_ptr, prob_number_dev_ptr + 1, pulled_index_dev_ptr);
+		cudaMemcpy(&idx, pulled_index, sizeof(int), cudaMemcpyDeviceToHost);
+		cudaMemcpy(centroids + num_centroids * D, data + idx * D, D * sizeof(float), cudaMemcpyHostToDevice);
+	}
+
+	cudaFree(result_d);
+	cudaFree(min_array_d);
+	cudaFree(pulled_index);
+	cudaFree(prob_number);
+}
 
 
 int main()
 {
-
-	distance_test();
+	//distance_test();
 	std::random_device device;
 	std::mt19937 generator(device());
 	std::normal_distribution<float> distribution(0.0f, 1.0f);
@@ -427,11 +497,14 @@ int main()
 	cudaMalloc(&locks_d, K * sizeof(int));
 
 	cudaMemcpy(data_d, data.data(), N * D * sizeof(float), cudaMemcpyHostToDevice);
+	/*
 	for (int i = 0; i < K; i++)
 	{
 		int idx = random_x(generator);
 		cudaMemcpy(centroids_d + i * D, data_d + idx * D, D * sizeof(float), cudaMemcpyDeviceToDevice);
 	}
+	*/
+	
 
 	//hyperparams
 	constexpr int tile_size_x = 128;
@@ -443,8 +516,9 @@ int main()
 	std::cout << "Data sent. Starting computation.\n";
 	auto now = std::chrono::high_resolution_clock::now();
 
+	kmeans_plus_plus_init<N, K, D>(data_d, centroids_d);
 
-	for (int i = 0; i < 1; i++)
+	for (int i = 0; i < 10; i++)
 	{
 		kmeans_try_seven<tile_size_x, tile_size_d, tile_size_c, 8, 8> << <grid, block >> > (data_d, centroids_d, result_d, N, D, K);
 		kmeans_argmin<K> << < N, (K + 1) / 2 >> > (result_d, argmin_d, K);
@@ -463,13 +537,19 @@ int main()
 	std::cout << "Data received. Finished computation.\n";
 	std::cout << "GPU time: " << std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() << "ms\n";
 
-	//find cluster with minimum first dimension
-	int min_cluster = 0;
-	for (int i = 1; i < K; i++)
+	std::vector<float> clusters_first_dim(K);
+	for (int i = 0; i < K; i++)
 	{
-		if (centroids[i * D] < centroids[min_cluster * D])
-			min_cluster = i;
-	}	
+		clusters_first_dim[i] = centroids[i * D];
+	}
+	std::sort(clusters_first_dim.begin(), clusters_first_dim.end());
+
+	for (int i = 0; i < K; i++)
+	{
+		std::cout << "Centroid " << i << ": ";
+		std::cout << clusters_first_dim[i] << ", ";
+		std::cout << "\n";
+	}
 
 
 	
